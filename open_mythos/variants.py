@@ -33,6 +33,35 @@ def mythos_1b() -> MythosConfig:
     )
 
 
+def mythos_1b_streams() -> MythosConfig:
+    """1B parameter config with multi-stream width extrapolation. Same as mythos_1b but with n_streams=4, max_streams=8."""
+    return MythosConfig(
+        vocab_size=32000,
+        dim=2048,
+        n_heads=16,
+        n_kv_heads=4,
+        max_seq_len=4096,
+        max_loop_iters=16,
+        prelude_layers=2,
+        coda_layers=2,
+        attn_type="mla",
+        kv_lora_rank=256,
+        q_lora_rank=512,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        n_experts=64,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=2048,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=8,
+        n_streams=4,
+        max_streams=8,
+    )
+
+
 def mythos_3b() -> MythosConfig:
     """3B parameter config. Compact inference model. dim=3072, 64 experts, 16 loop iters, 4k context."""
     return MythosConfig(

@@ -38,14 +38,19 @@ and bump --steps / --batch-size / --seq-len for a real comparison.
 
     # Aggressive depth extrapolation sweep
     python tests/small_benchmark.py --depth-sweep 1,2,4,8,16,32
+
+    # Multi-stream width extrapolation: train with 2 streams, sweep 1-8
+    python tests/small_benchmark.py --n-streams 2 --width-sweep 1,2,4,8
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Deque
 
 import torch
@@ -215,19 +220,35 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     vocab_size: int,
-) -> tuple[float, float]:
-    """Run one optimizer step; return (loss, wall-clock seconds)."""
+    contraction_weight: float = 0.0,
+) -> tuple[float, float, float]:
+    """Run one optimizer step; return (loss, wall-clock seconds, contraction_loss)."""
     t0 = time.perf_counter()
     model.train()
     optimizer.zero_grad()
     logits = model(x)
-    loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-    loss.backward()
+    ce_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+    c_loss = 0.0
+    if contraction_weight > 0 and isinstance(model, OpenMythos):
+        total_loss = ce_loss + contraction_weight * model.contraction_loss
+        c_loss = model.contraction_loss.item()
+    else:
+        total_loss = ce_loss
+    total_loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     if device.type == "cuda":
         torch.cuda.synchronize()
-    return loss.item(), time.perf_counter() - t0
+    return ce_loss.item(), time.perf_counter() - t0, c_loss
+
+
+@dataclass
+class EvalResult:
+    loss: float
+    accuracy: float
+
+    def __str__(self) -> str:
+        return f"loss={self.loss:.4f}  acc={self.accuracy:.2%}"
 
 
 @torch.no_grad()
@@ -238,14 +259,17 @@ def evaluate(
     vocab_size: int,
     max_batches: int | None = None,
     n_loops: int | None = None,
-) -> float:
-    """Mean cross-entropy over (up to `max_batches`) of the loader.
+    n_streams: int | None = None,
+) -> EvalResult:
+    """Mean cross-entropy and top-1 accuracy over (up to `max_batches`) of the loader.
 
-    `n_loops` is only forwarded to OpenMythos; for any other module the kwarg
-    is dropped, so the same function benchmarks baseline and mythos uniformly.
+    `n_loops` and `n_streams` are only forwarded to OpenMythos; for any other
+    module the kwargs are dropped, so the same function benchmarks baseline and
+    mythos uniformly.
     """
     model.eval()
     total_loss = 0.0
+    total_correct = 0
     total_tokens = 0
     for i, (x, y) in enumerate(loader):
         if max_batches is not None and i >= max_batches:
@@ -253,14 +277,20 @@ def evaluate(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         if isinstance(model, OpenMythos):
-            logits = model(x, n_loops=n_loops)
+            logits = model(x, n_loops=n_loops, n_streams=n_streams)
         else:
             logits = model(x)
+        flat_logits = logits.view(-1, vocab_size)
+        flat_y = y.view(-1)
         # sum-reduction so we weight by token count, not batch count
-        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1), reduction="sum")
+        loss = F.cross_entropy(flat_logits, flat_y, reduction="sum")
         total_loss += loss.item()
-        total_tokens += y.numel()
-    return total_loss / max(1, total_tokens)
+        total_correct += (flat_logits.argmax(dim=-1) == flat_y).sum().item()
+        total_tokens += flat_y.numel()
+    return EvalResult(
+        loss=total_loss / max(1, total_tokens),
+        accuracy=total_correct / max(1, total_tokens),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +298,15 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
-def build_tiny_cfg(vocab_size: int, seq_len: int) -> MythosConfig:
+def build_tiny_cfg(
+    vocab_size: int,
+    seq_len: int,
+    n_streams: int = 1,
+    max_streams: int = 8,
+    random_depth: bool = False,
+    random_width: bool = False,
+    contraction_weight: float = 0.0,
+) -> MythosConfig:
     """Tiny shared config with MLA attention — runs in reasonable time on CPU.
 
     MLA LoRA ranks and head dims scale with `dim=128` instead of the
@@ -297,6 +335,12 @@ def build_tiny_cfg(vocab_size: int, seq_len: int) -> MythosConfig:
         lora_rank=4,
         rope_theta=10000.0,
         dropout=0.0,
+        n_streams=n_streams,
+        max_streams=max_streams,
+        stream_lora_rank=4,
+        random_depth=random_depth,
+        random_width=random_width,
+        contraction_weight=contraction_weight,
     )
 
 
@@ -360,51 +404,109 @@ def parse_args() -> argparse.Namespace:
         default="1,2,4,8,16",
         help="comma-separated n_loops values for OpenMythos depth-extrapolation eval",
     )
+    p.add_argument(
+        "--n-streams",
+        type=int,
+        default=1,
+        help="number of parallel streams for training (1 = single-stream baseline)",
+    )
+    p.add_argument(
+        "--max-streams",
+        type=int,
+        default=8,
+        help="StreamLoRA embedding table size (must be >= n_streams)",
+    )
+    p.add_argument(
+        "--width-sweep",
+        default="",
+        help="comma-separated n_streams values for width-extrapolation eval "
+        "(e.g. '1,2,4,8'); empty string skips the sweep",
+    )
+    p.add_argument("--random-depth", action="store_true",
+                   help="sample n_loops ~ U[1, max_loop_iters] per batch during training")
+    p.add_argument("--random-width", action="store_true",
+                   help="sample n_streams ~ U[1, n_streams] per batch during training")
+    p.add_argument("--contraction-weight", type=float, default=0.0,
+                   help="λ for contraction regularization loss (0 = disabled)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    p.add_argument(
+        "--save-log",
+        default="",
+        help="path to save structured JSON log (empty = no save)",
+    )
     return p.parse_args()
 
 
 def load_text_ds(name: str, config: str, split: str):
-    """Streaming `load_dataset` with optional config (empty string == no config)."""
+    """Load dataset, preferring local cache over streaming.
+
+    Tries non-streaming first (works offline if cached); falls back to streaming
+    for datasets that were never fully downloaded.
+    """
+    kwargs = {"split": split}
     if config:
-        return load_dataset(name, config, split=split, streaming=True)
-    return load_dataset(name, split=split, streaming=True)
+        kwargs["name"] = config
+    try:
+        return load_dataset(name, **kwargs)
+    except Exception:
+        # Fall back to streaming if full download not cached
+        return load_dataset(name, streaming=True, **kwargs)
 
 
 def main() -> None:
+    import sys, os
+    # Force unbuffered output so SLURM logs update in real time
+    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
+
     args = parse_args()
     device = torch.device(args.device)
+
+    # Structured log for offline analysis
+    log: dict = {
+        "args": vars(args),
+        "train_log": [],       # per-step: {step, mythos_loss, base_loss, mythos_tps, base_tps}
+        "eval_log": [],        # periodic: {step, mythos: {loss, accuracy}, baseline: {loss, accuracy}}
+        "depth_sweep": [],     # {n_loops, loss, accuracy, delta_loss}
+        "width_sweep": [],     # {n_streams, loss, accuracy, delta_loss}
+        "summary": {},
+    }
 
     print(
         f"[setup] device={device}  batch={args.batch_size}  "
         f"seq_len={args.seq_len}  steps={args.steps}"
     )
 
+    print("[debug] loading tokenizer...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     # AutoTokenizer.vocab_size can be smaller than the head size for BPE
     # tokenizers with added tokens; use len(tokenizer) to be safe.
     vocab_size = len(tokenizer)
-    print(f"[setup] tokenizer={args.tokenizer}  vocab_size={vocab_size:,}")
+    print(f"[setup] tokenizer={args.tokenizer}  vocab_size={vocab_size:,}", flush=True)
 
     # ------------------------------------------------------------------
     # Data: streamed train + held-out eval splits
     # ------------------------------------------------------------------
-    print(f"[setup] dataset={args.dataset}  config={args.dataset_config or '∅'}")
+    print(f"[setup] dataset={args.dataset}  config={args.dataset_config or '∅'}", flush=True)
+    print("[debug] loading train split...", flush=True)
     raw_train = load_text_ds(args.dataset, args.dataset_config, args.train_split)
+    print("[debug] tokenizing train data...", flush=True)
     train_ds = PackedLMDataset(
         raw_train, tokenizer, args.seq_len, args.train_tokens, args.text_field
     )
+    print("[debug] loading eval split...", flush=True)
     raw_eval = load_text_ds(args.dataset, args.dataset_config, args.eval_split)
+    print("[debug] tokenizing eval data...", flush=True)
     eval_ds = PackedLMDataset(
         raw_eval, tokenizer, args.seq_len, args.eval_tokens, args.text_field
     )
     print(
         f"[setup] train tokens={train_ds.data.numel():,}  pairs={len(train_ds)}  |  "
-        f"eval tokens={eval_ds.data.numel():,}  pairs={len(eval_ds)}"
+        f"eval tokens={eval_ds.data.numel():,}  pairs={len(eval_ds)}",
+        flush=True,
     )
 
     torch.manual_seed(args.seed)
@@ -418,15 +520,24 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Models — same init seed so both start from the same embedding
     # ------------------------------------------------------------------
-    cfg = build_tiny_cfg(vocab_size, args.seq_len)
+    cfg = build_tiny_cfg(
+        vocab_size, args.seq_len, args.n_streams, args.max_streams,
+        random_depth=args.random_depth,
+        random_width=args.random_width,
+        contraction_weight=args.contraction_weight,
+    )
 
+    print("[debug] building OpenMythos model...", flush=True)
     torch.manual_seed(args.seed)
     mythos = OpenMythos(cfg).to(device)
+    print("[debug] OpenMythos model ready", flush=True)
 
     # Parameter-matched depth: prelude + one unique recurrent block + coda.
     baseline_layers = cfg.prelude_layers + 1 + cfg.coda_layers
+    print("[debug] building Baseline model...", flush=True)
     torch.manual_seed(args.seed)
     baseline = BaselineTransformer(cfg, n_layers=baseline_layers).to(device)
+    print("[debug] Baseline model ready", flush=True)
 
     n_m, n_b = count_params(mythos), count_params(baseline)
     print(
@@ -439,6 +550,11 @@ def main() -> None:
         f"loops({cfg.max_loop_iters}) + coda({cfg.coda_layers}) = "
         f"{cfg.prelude_layers + cfg.max_loop_iters + cfg.coda_layers}"
     )
+    if cfg.n_streams > 1:
+        print(
+            f"[setup] Mythos streams = {cfg.n_streams} (max={cfg.max_streams}, "
+            f"stream_lora_rank={cfg.stream_lora_rank})"
+        )
 
     opt_m = torch.optim.AdamW(
         mythos.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1
@@ -460,6 +576,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Training loop with periodic held-out eval
     # ------------------------------------------------------------------
+    print("[debug] starting training loop...", flush=True)
     data_iter = iter(train_loader)
     t_total = time.perf_counter()
     for step in range(1, args.steps + 1):
@@ -472,8 +589,10 @@ def main() -> None:
         y = y.to(device, non_blocking=True)
         tokens = x.numel()
 
-        loss_m, dt_m = train_step(mythos, x, y, opt_m, device, vocab_size)
-        loss_b, dt_b = train_step(baseline, x, y, opt_b, device, vocab_size)
+        loss_m, dt_m, c_loss = train_step(
+            mythos, x, y, opt_m, device, vocab_size, args.contraction_weight
+        )
+        loss_b, dt_b, _ = train_step(baseline, x, y, opt_b, device, vocab_size)
 
         mm.update(loss_m, tokens, dt_m)
         bm.update(loss_b, tokens, dt_b)
@@ -483,6 +602,16 @@ def main() -> None:
                 f"{step:>6} | {loss_m:>12.4f} | {loss_b:>10.4f} | "
                 f"{tokens / dt_m:>13,.0f} | {tokens / dt_b:>11,.0f}"
             )
+            entry = {
+                "step": step,
+                "mythos_loss": loss_m,
+                "base_loss": loss_b,
+                "mythos_tok_per_sec": tokens / dt_m,
+                "base_tok_per_sec": tokens / dt_b,
+            }
+            if args.contraction_weight > 0:
+                entry["contraction_loss"] = c_loss
+            log["train_log"].append(entry)
 
         if args.eval_every and step % args.eval_every == 0:
             eval_m = evaluate(
@@ -493,9 +622,15 @@ def main() -> None:
             )
             eval_history.append((step, eval_m, eval_b))
             print(
-                f"  [eval @ step {step}]  mythos {eval_m:.4f}   baseline {eval_b:.4f}   "
-                f"(Δ = {eval_m - eval_b:+.4f})"
+                f"  [eval @ step {step}]  mythos {eval_m.loss:.4f} ({eval_m.accuracy:.2%})   "
+                f"baseline {eval_b.loss:.4f} ({eval_b.accuracy:.2%})   "
+                f"(Δloss = {eval_m.loss - eval_b.loss:+.4f})"
             )
+            log["eval_log"].append({
+                "step": step,
+                "mythos": asdict(eval_m),
+                "baseline": asdict(eval_b),
+            })
 
     total_wall = time.perf_counter() - t_total
 
@@ -531,6 +666,27 @@ def main() -> None:
         f"{bm.total_time / max(1, bm.steps):>16.4f}"
     )
 
+    log["summary"] = {
+        "steps": args.steps,
+        "wall_clock_sec": total_wall,
+        "mythos": {
+            "params": n_m,
+            "initial_loss": mm.initial_loss,
+            "final_loss": mm.final_loss,
+            "avg_loss": mm.avg_loss,
+            "train_time_sec": mm.total_time,
+            "avg_tok_per_sec": mm.tok_per_sec,
+        },
+        "baseline": {
+            "params": n_b,
+            "initial_loss": bm.initial_loss,
+            "final_loss": bm.final_loss,
+            "avg_loss": bm.avg_loss,
+            "train_time_sec": bm.total_time,
+            "avg_tok_per_sec": bm.tok_per_sec,
+        },
+    }
+
     # ------------------------------------------------------------------
     # Depth extrapolation: OpenMythos eval loss as a function of n_loops.
     # Trained at cfg.max_loop_iters; we run inference with a sweep to see
@@ -540,23 +696,88 @@ def main() -> None:
     loops_sweep = sorted({int(s) for s in args.depth_sweep.split(",") if s.strip()})
     print(f"\n{bar}\nDepth extrapolation (held-out eval, full eval set)\n{bar}")
     baseline_eval = evaluate(baseline, eval_loader, device, vocab_size)
-    print(f"  Baseline (fixed depth)          : eval loss = {baseline_eval:.4f}")
-    # First collect all sweep losses, then print with deltas vs. the trained depth.
-    sweep: list[tuple[int, float]] = []
+    print(f"  Baseline (fixed depth)          : {baseline_eval}")
+    # First collect all sweep results, then print with deltas vs. the trained depth.
+    sweep: list[tuple[int, EvalResult]] = []
     for nl in loops_sweep:
         sweep.append(
             (nl, evaluate(mythos, eval_loader, device, vocab_size, n_loops=nl))
         )
-    trained_loss = next((loss for nl, loss in sweep if nl == cfg.max_loop_iters), None)
+    trained_res = next((r for nl, r in sweep if nl == cfg.max_loop_iters), None)
     print(f"  OpenMythos (trained at n_loops={cfg.max_loop_iters}):")
-    print(f"    {'n_loops':>8}  {'eval loss':>10}  {'Δ vs trained':>14}")
-    for nl, loss in sweep:
-        if trained_loss is None or nl == cfg.max_loop_iters:
+    print(f"    {'n_loops':>8}  {'eval loss':>10}  {'accuracy':>10}  {'Δ loss':>10}")
+    for nl, r in sweep:
+        if trained_res is None or nl == cfg.max_loop_iters:
+            delta_loss = 0.0
             delta_str = ""
         else:
-            delta_str = f"{loss - trained_loss:+.4f}"
+            delta_loss = r.loss - trained_res.loss
+            delta_str = f"{delta_loss:+.4f}"
         marker = " ←trained" if nl == cfg.max_loop_iters else ""
-        print(f"    {nl:>8}  {loss:>10.4f}  {delta_str:>14}{marker}")
+        print(f"    {nl:>8}  {r.loss:>10.4f}  {r.accuracy:>9.2%}  {delta_str:>10}{marker}")
+        log["depth_sweep"].append({
+            "n_loops": nl,
+            "loss": r.loss,
+            "accuracy": r.accuracy,
+            "delta_loss": delta_loss,
+            "is_trained": nl == cfg.max_loop_iters,
+        })
+    log["baseline_eval"] = asdict(baseline_eval)
+
+    # ------------------------------------------------------------------
+    # Width extrapolation: OpenMythos eval loss as a function of n_streams.
+    # Trained at cfg.n_streams; we sweep different stream counts to see
+    # whether more streams keep improving (width extrapolation) or
+    # degrade outside the trained regime.
+    # ------------------------------------------------------------------
+    width_sweep_str = args.width_sweep.strip()
+    if width_sweep_str and cfg.n_streams > 1:
+        streams_sweep = sorted(
+            {int(s) for s in width_sweep_str.split(",") if s.strip()}
+        )
+        print(f"\n{bar}\nWidth extrapolation (held-out eval, full eval set)\n{bar}")
+        print(f"  Baseline (no streams)           : {baseline_eval}")
+        wsweep: list[tuple[int, EvalResult]] = []
+        for ns in streams_sweep:
+            wsweep.append(
+                (ns, evaluate(mythos, eval_loader, device, vocab_size, n_streams=ns))
+            )
+        trained_w_res = next(
+            (r for ns, r in wsweep if ns == cfg.n_streams), None
+        )
+        print(f"  OpenMythos (trained at n_streams={cfg.n_streams}):")
+        print(f"    {'n_streams':>10}  {'eval loss':>10}  {'accuracy':>10}  {'Δ loss':>10}")
+        for ns, r in wsweep:
+            if trained_w_res is None or ns == cfg.n_streams:
+                delta_loss = 0.0
+                delta_str = ""
+            else:
+                delta_loss = r.loss - trained_w_res.loss
+                delta_str = f"{delta_loss:+.4f}"
+            marker = " ←trained" if ns == cfg.n_streams else ""
+            print(f"    {ns:>10}  {r.loss:>10.4f}  {r.accuracy:>9.2%}  {delta_str:>10}{marker}")
+            log["width_sweep"].append({
+                "n_streams": ns,
+                "loss": r.loss,
+                "accuracy": r.accuracy,
+                "delta_loss": delta_loss,
+                "is_trained": ns == cfg.n_streams,
+            })
+    elif width_sweep_str and cfg.n_streams == 1:
+        print(
+            f"\n[skip] --width-sweep requires --n-streams > 1 "
+            f"(current: {cfg.n_streams})"
+        )
+
+    # ------------------------------------------------------------------
+    # Save structured JSON log for offline analysis
+    # ------------------------------------------------------------------
+    if args.save_log:
+        log_path = Path(args.save_log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w") as f:
+            json.dump(log, f, indent=2)
+        print(f"\n[log] saved to {log_path}")
 
 
 if __name__ == "__main__":

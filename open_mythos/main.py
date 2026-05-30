@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,6 +81,15 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # Width extrapolation (multi-stream)
+    n_streams: int = 1              # 1 = original single-stream (backward compat)
+    max_streams: int = 4            # StreamLoRA embedding table size
+    stream_lora_rank: int = 16      # per-stream LoRA rank
+    cross_stream_every: int = 0     # cross-stream attn interval (0=disabled)
+    # Extrapolation regularization
+    random_depth: bool = False      # sample n_loops ~ U[1, max_loop_iters] per batch
+    random_width: bool = False      # sample n_streams ~ U[1, max_streams] per training batch
+    contraction_weight: float = 0.0 # λ for contraction loss (0 = disabled)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +582,43 @@ def loop_index_embedding(
 
 
 # ---------------------------------------------------------------------------
+# Stream-index embedding (differentiates recurrent block across streams)
+# ---------------------------------------------------------------------------
+
+
+def stream_index_embedding(
+    h: torch.Tensor, stream_w: int, stream_dim: int, theta: float = 10000.0
+) -> torch.Tensor:
+    """
+    Inject a sinusoidal stream-index signal into channels [dim//8 : dim//8 + stream_dim].
+
+    Dual to loop_index_embedding but uses a non-overlapping channel slice so the
+    two signals don't interfere. Loop embedding occupies [0 : dim//8]; stream
+    embedding occupies [dim//8 : dim//4].
+
+    Args:
+        h          -- hidden state tensor of shape (B, T, dim)
+        stream_w   -- current stream index (0-based)
+        stream_dim -- number of channels to receive the embedding (must be even)
+        theta      -- sinusoidal base frequency
+
+    Returns:
+        h with a sinusoidal bias added to its stream channels; same shape
+    """
+    freqs = 1.0 / (
+        theta
+        ** (torch.arange(0, stream_dim, 2, device=h.device, dtype=h.dtype) / stream_dim)
+    )
+    angles = stream_w * freqs  # (stream_dim//2,)
+    emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:stream_dim]
+    dim = h.shape[-1]
+    start = dim // 8
+    emb_full = torch.zeros(dim, device=h.device, dtype=h.dtype)
+    emb_full[start : start + stream_dim] = emb
+    return h + emb_full.unsqueeze(0).unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
 # Depth-wise LoRA adapter (per loop iteration)
 # ---------------------------------------------------------------------------
 
@@ -617,6 +665,93 @@ class LoRAAdapter(nn.Module):
         s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
         down = self.down(x) * s  # (B, T, rank)
         return down @ self.B  # (B, T, dim)
+
+
+# ---------------------------------------------------------------------------
+# Stream-wise LoRA adapter (per stream)
+# ---------------------------------------------------------------------------
+
+
+class StreamLoRAAdapter(nn.Module):
+    """
+    Stream-wise LoRA adaptation — dual to LoRAAdapter but across streams.
+
+    Shared low-rank down-projection and up-projection with a per-stream scale
+    vector. Clamps to last index for width extrapolation (mirrors depth clamp).
+
+    delta(x, w) = (down(x) * scale[w]) @ B
+    """
+
+    def __init__(self, dim: int, rank: int, max_streams: int):
+        super().__init__()
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.B = nn.Parameter(torch.randn(rank, dim) * 0.02)
+        self.scale = nn.Embedding(max_streams, rank)
+
+    def forward(self, x: torch.Tensor, stream_w: int) -> torch.Tensor:
+        max_w = self.scale.num_embeddings - 1
+        w_idx = stream_w if stream_w <= max_w else max_w
+        s = self.scale(torch.tensor(w_idx, device=x.device))
+        down = self.down(x) * s
+        return down @ self.B
+
+
+# ---------------------------------------------------------------------------
+# StreamNorm (prevents inter-stream divergence/collapse)
+# ---------------------------------------------------------------------------
+
+
+class StreamNorm(nn.Module):
+    """
+    Normalize across the stream dimension to prevent inter-stream divergence
+    or collapse. Dual to LTI stability for depth.
+
+    Given a list of W stream tensors each of shape (B, T, D):
+    1. Stack into (W, B, T, D)
+    2. Normalize across dim=0 (stream dimension)
+    3. Learnable gamma rescale
+    4. Re-center around mean to preserve information
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, streams: list[torch.Tensor]) -> list[torch.Tensor]:
+        stacked = torch.stack(streams, dim=0)  # (W, B, T, D)
+        mean = stacked.mean(dim=0, keepdim=True)
+        var = stacked.var(dim=0, keepdim=True, unbiased=False)
+        normed = (stacked - mean) / (var + self.eps).sqrt()
+        # rescale and re-center around the stream mean
+        out = normed * self.gamma + mean
+        return [out[w] for w in range(out.shape[0])]
+
+
+# ---------------------------------------------------------------------------
+# StreamMerge (gated aggregation of streams back to single hidden state)
+# ---------------------------------------------------------------------------
+
+
+class StreamMerge(nn.Module):
+    """
+    Gated aggregation of W streams back to a single hidden state.
+
+    Per-stream importance scorer produces input-dependent weights so
+    different tokens can draw from different streams.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.scorer = nn.Linear(dim, 1)
+
+    def forward(self, streams: list[torch.Tensor]) -> torch.Tensor:
+        # streams: list of W tensors each (B, T, D)
+        stacked = torch.stack(streams, dim=0)  # (W, B, T, D)
+        scores = self.scorer(stacked).squeeze(-1)  # (W, B, T)
+        weights = F.softmax(scores, dim=0)  # (W, B, T)
+        merged = (weights.unsqueeze(-1) * stacked).sum(dim=0)  # (B, T, D)
+        return merged
 
 
 # ---------------------------------------------------------------------------
@@ -847,20 +982,35 @@ class RecurrentBlock(nn.Module):
         Returns:
             ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
         """
-        n_loops = n_loops or self.cfg.max_loop_iters
+        if n_loops is None:
+            if self.training and self.cfg.random_depth:
+                n_loops = random.randint(1, self.cfg.max_loop_iters)
+            else:
+                n_loops = self.cfg.max_loop_iters
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
+        prev_delta = None
+        contraction_loss = torch.tensor(0.0, device=h.device)
 
         for t in range(n_loops):
+            h_old = h
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
+
+            # Contraction regularization: penalize when ||h_new - h_old||²
+            # increases from one iteration to the next
+            if self.cfg.contraction_weight > 0:
+                delta = (h - h_old).pow(2).mean()
+                if prev_delta is not None and delta > prev_delta:
+                    contraction_loss = contraction_loss + (delta - prev_delta)
+                prev_delta = delta
 
             p = self.act(h)  # (B, T)
             still_running = ~halted
@@ -888,6 +1038,146 @@ class RecurrentBlock(nn.Module):
             if halted.all() and kv_cache is None:
                 break
 
+        self._contraction_loss = contraction_loss
+        return h_out
+
+
+# ---------------------------------------------------------------------------
+# Multi-Stream Recurrent Block (width extrapolation)
+# ---------------------------------------------------------------------------
+
+
+class MultiStreamRecurrentBlock(nn.Module):
+    """
+    Width-extrapolation dual to RecurrentBlock's depth extrapolation.
+
+    Runs W parallel streams through the same shared TransformerBlock, each
+    differentiated by stream_index_embedding + StreamLoRAAdapter. At inference
+    time, W can be increased beyond the training value to expand representational
+    capacity (width extrapolation).
+
+    All streams are batched into the batch dimension (W*B, T, D) for efficient
+    GPU processing. After each loop step, streams are unstacked for StreamNorm,
+    then restacked. After all loops, StreamMerge aggregates streams back to (B, T, D).
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.block = TransformerBlock(cfg, use_moe=True)
+        self.injection = LTIInjection(cfg.dim)
+        self.act = ACTHalting(cfg.dim)
+        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
+        self.stream_lora = StreamLoRAAdapter(cfg.dim, cfg.stream_lora_rank, cfg.max_streams)
+        self.stream_norm = StreamNorm(cfg.dim)
+        self.norm = RMSNorm(cfg.dim)
+        self.loop_dim = cfg.dim // 8
+        self.stream_dim = cfg.dim // 8
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        kv_cache: Optional[dict] = None,
+        n_streams: Optional[int] = None,
+    ) -> torch.Tensor:
+        if n_loops is None:
+            if self.training and self.cfg.random_depth:
+                n_loops = random.randint(1, self.cfg.max_loop_iters)
+            else:
+                n_loops = self.cfg.max_loop_iters
+        if n_streams is None:
+            if self.training and self.cfg.random_width:
+                W = random.randint(1, self.cfg.max_streams)
+            else:
+                W = self.cfg.n_streams
+        else:
+            W = n_streams
+        B, T, D = h.shape
+
+        # Initialize W streams from e + stream_index_embedding(w)
+        streams = [
+            stream_index_embedding(h.clone(), w, self.stream_dim) for w in range(W)
+        ]
+
+        halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
+        cumulative_p = torch.zeros(B, T, device=h.device)
+        h_out = torch.zeros_like(h)
+        prev_delta = None
+        contraction_loss = torch.tensor(0.0, device=h.device)
+
+        for t in range(n_loops):
+            # Apply loop_index_embedding to each stream
+            for w in range(W):
+                streams[w] = loop_index_embedding(streams[w], t, self.loop_dim)
+
+            # Stack streams into batch dim: (W*B, T, D)
+            h_stacked = torch.cat(streams, dim=0)
+            e_stacked = e.repeat(W, 1, 1)
+
+            combined = self.norm(h_stacked + e_stacked)
+
+            # Expand mask for stacked batch
+            stacked_mask = mask
+            if mask is not None and mask.shape[0] == 1:
+                # mask is (1, 1, T, T), broadcasts fine
+                pass
+
+            cache_key = f"recurrent_loop_{t}"
+            h_stacked_old = h_stacked
+            trans_out = self.block(combined, freqs_cis, stacked_mask, kv_cache, cache_key)
+            trans_out = trans_out + self.lora(trans_out, t)
+
+            # Apply per-stream LoRA: need to unstack, apply, restack
+            stream_chunks = torch.chunk(trans_out, W, dim=0)
+            trans_streams = [
+                chunk + self.stream_lora(chunk, w)
+                for w, chunk in enumerate(stream_chunks)
+            ]
+
+            # LTI injection per stream
+            e_chunks = torch.chunk(e_stacked, W, dim=0)
+            streams = [
+                self.injection(streams[w], e_chunks[w], trans_streams[w])
+                for w in range(W)
+            ]
+
+            # Contraction regularization
+            if self.cfg.contraction_weight > 0:
+                h_stacked_new = torch.cat(streams, dim=0)
+                delta = (h_stacked_new - h_stacked_old).pow(2).mean()
+                if prev_delta is not None and delta > prev_delta:
+                    contraction_loss = contraction_loss + (delta - prev_delta)
+                prev_delta = delta
+
+            # StreamNorm across streams
+            if W > 1:
+                streams = self.stream_norm(streams)
+
+            # ACT halting on mean across streams
+            h_mean = torch.stack(streams, dim=0).mean(dim=0)  # (B, T, D)
+            p = self.act(h_mean)
+            still_running = ~halted
+
+            remainder = (1.0 - cumulative_p).clamp(min=0)
+            weight = torch.where(
+                cumulative_p + p >= self.cfg.act_threshold,
+                remainder,
+                p,
+            )
+            weight = weight * still_running.float()
+            h_out = h_out + weight.unsqueeze(-1) * h_mean
+
+            cumulative_p = cumulative_p + p * still_running.float()
+            halted = halted | (cumulative_p >= self.cfg.act_threshold)
+
+            if halted.all() and kv_cache is None:
+                break
+
+        self._contraction_loss = contraction_loss
         return h_out
 
 
@@ -946,7 +1236,10 @@ class OpenMythos(nn.Module):
         self.prelude = nn.ModuleList(
             [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.prelude_layers)]
         )
-        self.recurrent = RecurrentBlock(cfg)
+        if cfg.n_streams > 1:
+            self.recurrent = MultiStreamRecurrentBlock(cfg)
+        else:
+            self.recurrent = RecurrentBlock(cfg)
         self.coda = nn.ModuleList(
             [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.coda_layers)]
         )
@@ -995,6 +1288,7 @@ class OpenMythos(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        n_streams: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -1009,6 +1303,8 @@ class OpenMythos(nn.Module):
                          sequence; used to select the correct RoPE frequencies
                          during incremental decoding (0 for prefill, prompt_len
                          for each subsequent decode step)
+            n_streams -- number of parallel streams; defaults to cfg.n_streams.
+                         Increase at inference for width extrapolation.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -1026,7 +1322,11 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        if isinstance(self.recurrent, MultiStreamRecurrentBlock):
+            x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache, n_streams)
+        else:
+            x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        self.contraction_loss = self.recurrent._contraction_loss
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
@@ -1041,6 +1341,7 @@ class OpenMythos(nn.Module):
         n_loops: int = 8,
         temperature: float = 1.0,
         top_k: int = 50,
+        n_streams: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Autoregressive token generation with KV caching.
@@ -1052,6 +1353,7 @@ class OpenMythos(nn.Module):
 
         n_loops can be set higher than the training value to extrapolate to
         harder problems at inference time (depth extrapolation property).
+        n_streams can be set higher for width extrapolation.
 
         Args:
             input_ids      -- prompt token indices of shape (B, T)
@@ -1059,6 +1361,7 @@ class OpenMythos(nn.Module):
             n_loops        -- recurrent loop depth for each decode step
             temperature    -- softmax temperature; lower = more greedy
             top_k          -- restrict sampling to top-K logits (0 = disabled)
+            n_streams      -- number of parallel streams; defaults to cfg.n_streams
 
         Returns:
             Token indices of shape (B, T + max_new_tokens)
@@ -1073,7 +1376,8 @@ class OpenMythos(nn.Module):
                 cur_ids = input_ids[:, -1:]
                 start_pos = prompt_len + step - 1
             logits = self.forward(
-                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos,
+                n_streams=n_streams,
             )
             logits = logits[:, -1, :] / temperature
             if top_k > 0:

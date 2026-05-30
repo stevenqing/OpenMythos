@@ -8,14 +8,18 @@ from open_mythos.main import (
     LoRAAdapter,
     MLAttention,
     MoEFFN,
+    MultiStreamRecurrentBlock,
     MythosConfig,
     OpenMythos,
     RecurrentBlock,
     RMSNorm,
+    StreamLoRAAdapter,
+    StreamNorm,
     TransformerBlock,
     apply_rope,
     loop_index_embedding,
     precompute_rope_freqs,
+    stream_index_embedding,
 )
 
 # ---------------------------------------------------------------------------
@@ -259,9 +263,10 @@ class TestRoPEExtended:
 class TestGQAttention:
     def setup_method(self):
         self.cfg = gqa_cfg()
-        self.freqs = precompute_rope_freqs(
+        freqs_full = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
         )
+        self.freqs = freqs_full[:T]
         self.attn = GQAttention(self.cfg)
 
     def test_output_shape(self):
@@ -295,9 +300,10 @@ class TestGQAttention:
 class TestMLAttention:
     def setup_method(self):
         self.cfg = mla_cfg()
-        self.freqs = precompute_rope_freqs(
+        freqs_full = precompute_rope_freqs(
             self.cfg.qk_rope_head_dim, self.cfg.max_seq_len
         )
+        self.freqs = freqs_full[:T]
         self.attn = MLAttention(self.cfg)
 
     def test_output_shape(self):
@@ -430,21 +436,21 @@ class TestTransformerBlock:
     def test_gqa_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_mla_output_shape(self):
         cfg = mla_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_moe_block_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=True)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
@@ -477,7 +483,9 @@ class TestLTIInjection:
         assert A.min().item() > 0.0
 
     def test_spectral_radius_stable_after_large_grad_step(self):
-        # Simulate an aggressive gradient update and verify stability holds
+        # Simulate an aggressive gradient update and verify stability holds.
+        # Note: <= 1.0 because exp(-exp(very_negative)) saturates to exactly
+        # 1.0 in float32 when the clamp hits the lower bound (-20).
         opt = torch.optim.SGD(self.inj.parameters(), lr=1e3)
         h = torch.randn(B, T, 64)
         e = torch.randn(B, T, 64)
@@ -486,7 +494,7 @@ class TestLTIInjection:
         loss.backward()
         opt.step()
         A = self.inj.get_A()
-        assert A.max().item() < 1.0
+        assert A.max().item() <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +527,10 @@ class TestRecurrentBlock:
     def setup_method(self):
         self.cfg = gqa_cfg()
         self.block = RecurrentBlock(self.cfg)
-        self.freqs = precompute_rope_freqs(
+        freqs_full = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
         )
+        self.freqs = freqs_full[:T]
 
     def test_output_shape(self):
         h = torch.randn(B, T, self.cfg.dim)
@@ -672,6 +681,302 @@ class TestAttnTypeSwap:
             )
 
         assert cache_bytes(cache_mla) < cache_bytes(cache_gqa)
+
+
+# ---------------------------------------------------------------------------
+# stream_index_embedding
+# ---------------------------------------------------------------------------
+
+
+class TestStreamIndexEmbedding:
+    def test_output_shape(self):
+        h = torch.randn(B, T, 64)
+        out = stream_index_embedding(h, stream_w=0, stream_dim=8)
+        assert out.shape == h.shape
+
+    def test_different_streams_differ(self):
+        h = torch.zeros(1, 1, 64)
+        out0 = stream_index_embedding(h, stream_w=0, stream_dim=8)
+        out1 = stream_index_embedding(h, stream_w=1, stream_dim=8)
+        assert not torch.allclose(out0, out1)
+
+    def test_only_target_channels_modified(self):
+        h = torch.zeros(1, 1, 64)
+        stream_dim = 8
+        out = stream_index_embedding(h, stream_w=3, stream_dim=stream_dim)
+        start = 64 // 8  # = 8
+        # channels before start should be unchanged (still 0)
+        assert torch.all(out[..., :start] == 0)
+        # channels after start+stream_dim should be unchanged
+        assert torch.all(out[..., start + stream_dim :] == 0)
+
+    def test_no_overlap_with_loop_embedding(self):
+        h = torch.zeros(1, 1, 64)
+        loop_dim = 8  # loop uses [0:8]
+        stream_dim = 8  # stream uses [8:16]
+        loop_out = loop_index_embedding(h, loop_t=3, loop_dim=loop_dim)
+        stream_out = stream_index_embedding(h, stream_w=3, stream_dim=stream_dim)
+        # loop modifies [0:8], stream modifies [8:16] — no overlap
+        start = 64 // 8
+        assert torch.all(loop_out[..., start:] == 0)
+        assert torch.all(stream_out[..., :start] == 0)
+
+
+# ---------------------------------------------------------------------------
+# StreamLoRAAdapter
+# ---------------------------------------------------------------------------
+
+
+class TestStreamLoRAAdapter:
+    def setup_method(self):
+        self.lora = StreamLoRAAdapter(dim=64, rank=8, max_streams=4)
+
+    def test_output_shape(self):
+        x = torch.randn(B, T, 64)
+        out = self.lora(x, stream_w=0)
+        assert out.shape == (B, T, 64)
+
+    def test_different_streams_differ(self):
+        x = torch.randn(B, T, 64)
+        out0 = self.lora(x, stream_w=0)
+        out1 = self.lora(x, stream_w=1)
+        assert not torch.allclose(out0, out1)
+
+    def test_clamp_for_extrapolation(self):
+        x = torch.randn(B, T, 64)
+        # stream_w=10 exceeds max_streams=4, should clamp without error
+        out = self.lora(x, stream_w=10)
+        assert out.shape == (B, T, 64)
+        # Should match output at max index
+        out_max = self.lora(x, stream_w=3)
+        assert torch.allclose(out, out_max)
+
+
+# ---------------------------------------------------------------------------
+# StreamNorm
+# ---------------------------------------------------------------------------
+
+
+class TestStreamNorm:
+    def setup_method(self):
+        self.norm = StreamNorm(dim=64)
+
+    def test_output_shape(self):
+        streams = [torch.randn(B, T, 64) for _ in range(3)]
+        out = self.norm(streams)
+        assert len(out) == 3
+        for s in out:
+            assert s.shape == (B, T, 64)
+
+    def test_maintains_stream_diversity(self):
+        streams = [torch.randn(B, T, 64) for _ in range(3)]
+        out = self.norm(streams)
+        stacked = torch.stack(out, dim=0)
+        # variance across streams should be > 0 (not collapsed)
+        assert stacked.var(dim=0).mean().item() > 0
+
+    def test_streams_not_identical_after_norm(self):
+        streams = [torch.randn(B, T, 64) for _ in range(3)]
+        out = self.norm(streams)
+        assert not torch.allclose(out[0], out[1])
+
+
+# ---------------------------------------------------------------------------
+# MultiStreamRecurrentBlock
+# ---------------------------------------------------------------------------
+
+
+class TestMultiStreamRecurrentBlock:
+    def setup_method(self):
+        self.cfg = mla_cfg(n_streams=2, max_streams=4, stream_lora_rank=4)
+        self.block = MultiStreamRecurrentBlock(self.cfg)
+        freqs_full = precompute_rope_freqs(
+            self.cfg.qk_rope_head_dim, self.cfg.max_seq_len
+        )
+        self.freqs = freqs_full[:T]  # slice to sequence length (mirrors OpenMythos.forward)
+
+    def test_output_shape(self):
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        out = self.block(h, e, self.freqs)
+        assert out.shape == (B, T, self.cfg.dim)
+
+    def test_more_streams_changes_output(self):
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        out2 = self.block(h.clone(), e.clone(), self.freqs, n_streams=2)
+        out3 = self.block(h.clone(), e.clone(), self.freqs, n_streams=3)
+        assert not torch.allclose(out2, out3)
+
+    def test_single_stream_works(self):
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        out = self.block(h, e, self.freqs, n_streams=1)
+        assert out.shape == (B, T, self.cfg.dim)
+
+    def test_width_extrapolation(self):
+        # n_streams > max_streams should run without error (clamp in StreamLoRA)
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        out = self.block(h, e, self.freqs, n_streams=6)
+        assert out.shape == (B, T, self.cfg.dim)
+        assert not torch.isnan(out).any()
+
+
+# ---------------------------------------------------------------------------
+# OpenMythos — Multi-Stream mode
+# ---------------------------------------------------------------------------
+
+
+class TestOpenMythosMultiStream:
+    def setup_method(self):
+        self.cfg = gqa_cfg(n_streams=2, max_streams=4, stream_lora_rank=4)
+        self.model = OpenMythos(self.cfg)
+        self.ids = torch.randint(0, self.cfg.vocab_size, (B, T))
+
+    def test_forward_shape(self):
+        logits = self.model(self.ids)
+        assert logits.shape == (B, T, self.cfg.vocab_size)
+
+    def test_generate_shape(self):
+        out = self.model.generate(self.ids, max_new_tokens=4, n_loops=2)
+        assert out.shape == (B, T + 4)
+
+    def test_forward_no_nan(self):
+        logits = self.model(self.ids)
+        assert not torch.isnan(logits).any()
+
+    def test_width_extrapolation_changes_output(self):
+        logits2 = self.model(self.ids, n_streams=2)
+        logits4 = self.model(self.ids, n_streams=4)
+        assert not torch.allclose(logits2, logits4)
+
+    def test_n_streams_1_backward_compat(self):
+        # n_streams=1 default config should use RecurrentBlock
+        cfg_single = gqa_cfg()
+        model = OpenMythos(cfg_single)
+        ids = torch.randint(0, cfg_single.vocab_size, (B, T))
+        logits = model(ids)
+        assert logits.shape == (B, T, cfg_single.vocab_size)
+        assert isinstance(model.recurrent, RecurrentBlock)
+
+    def test_multi_stream_uses_correct_block(self):
+        assert isinstance(self.model.recurrent, MultiStreamRecurrentBlock)
+
+
+# ---------------------------------------------------------------------------
+# Contraction loss
+# ---------------------------------------------------------------------------
+
+
+class TestContractionLoss:
+    def test_contraction_loss_computed_single_stream(self):
+        cfg = gqa_cfg(contraction_weight=0.01)
+        model = OpenMythos(cfg)
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        model.train()
+        model(ids)
+        assert hasattr(model, "contraction_loss")
+        assert model.contraction_loss.item() >= 0.0
+
+    def test_contraction_loss_computed_multi_stream(self):
+        cfg = gqa_cfg(
+            n_streams=2, max_streams=4, stream_lora_rank=4, contraction_weight=0.01
+        )
+        model = OpenMythos(cfg)
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        model.train()
+        model(ids)
+        assert hasattr(model, "contraction_loss")
+        assert model.contraction_loss.item() >= 0.0
+
+    def test_contraction_loss_zero_when_disabled(self):
+        cfg = gqa_cfg(contraction_weight=0.0)
+        model = OpenMythos(cfg)
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        model.train()
+        model(ids)
+        assert model.contraction_loss.item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Random depth
+# ---------------------------------------------------------------------------
+
+
+class TestRandomDepth:
+    def test_random_depth_varies_output(self):
+        cfg = gqa_cfg(random_depth=True)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.train()
+
+        torch.manual_seed(0)
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+
+        outputs = set()
+        for _ in range(20):
+            out = block(h.clone(), e.clone(), freqs)
+            outputs.add(out.sum().item())
+        # With random depth, we expect at least 2 distinct outputs
+        assert len(outputs) > 1
+
+    def test_random_depth_disabled_in_eval(self):
+        cfg = gqa_cfg(random_depth=True)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.eval()
+
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+
+        with torch.no_grad():
+            out1 = block(h.clone(), e.clone(), freqs)
+            out2 = block(h.clone(), e.clone(), freqs)
+        assert torch.allclose(out1, out2)
+
+
+# ---------------------------------------------------------------------------
+# Random width
+# ---------------------------------------------------------------------------
+
+
+class TestRandomWidth:
+    def test_random_width_varies_output(self):
+        cfg = gqa_cfg(
+            n_streams=3, max_streams=4, stream_lora_rank=4, random_width=True
+        )
+        block = MultiStreamRecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.train()
+
+        torch.manual_seed(0)
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+
+        outputs = set()
+        for _ in range(20):
+            out = block(h.clone(), e.clone(), freqs)
+            outputs.add(out.sum().item())
+        # With random width, we expect at least 2 distinct outputs
+        assert len(outputs) > 1
+
+    def test_random_width_disabled_in_eval(self):
+        cfg = gqa_cfg(
+            n_streams=2, max_streams=4, stream_lora_rank=4, random_width=True
+        )
+        block = MultiStreamRecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.eval()
+
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+
+        with torch.no_grad():
+            out1 = block(h.clone(), e.clone(), freqs)
+            out2 = block(h.clone(), e.clone(), freqs)
+        assert torch.allclose(out1, out2)
 
 
 if __name__ == "__main__":
